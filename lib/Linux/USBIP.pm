@@ -3,21 +3,21 @@ package Linux::USBIP;
 use 5.006;
 use strict;
 use warnings;
+use Errno ();
 
 use Cwd qw/abs_path/;
-use Data::Dumper;
 
-our $vhci_driver = "/sys/devices/platform/vhci_hcd.0/";
-our $vhci_varrun = "/var/run/vhci_hcd/";
+our $vhci_driver = "/sys/devices/platform/vhci_hcd.0";
+our $vhci_varrun = "/var/run/vhci_hcd";
 our $vhci_attach = "attach";
 our $vhci_detach = "detach";
-our $host_driver = "/sys/bus/usb/drivers/usbip-host/";
-our $host_bind = $host_driver."bind";
-our $host_unbind = $host_driver."unbind";
-our $host_rebind = $host_driver."rebind";
-our $host_match_busid = $host_driver."match_busid";
-our $attr_sockfd = "/usbip_sockfd";
-our $attr_status = "/usbip_status";
+our $host_driver = "/sys/bus/usb/drivers/usbip-host";
+our $host_bind = "$host_driver/bind";
+our $host_unbind = "$host_driver/unbind";
+our $host_rebind = "$host_driver/rebind";
+our $host_match_busid = "$host_driver/match_busid";
+our $attr_sockfd = "usbip_sockfd";
+our $attr_status = "usbip_status";
 our %speed_map = (
                   '1.5'     => '1',
                   '12'      => '2',
@@ -67,16 +67,31 @@ Simple utility:
   
     case 'bind' {
       say "Binding $ARGV[1]:";
-      unless ($usbip->bind_dev($ARGV[1])) { say $usbip->{last_error} };
+      if ($usbip->bind($ARGV[1])) { 
+        say "Ok!";
+      }else{ 
+        say "Error code: ".$usbip->{error};
+        say $usbip->{error_msg}
+      };
     }
       
     case 'unbind' {
       say "Unbinding $ARGV[1]:";
-      unless ($usbip->unbind_dev($ARGV[1])) { say $usbip->{last_error} };
+      if ($usbip->unbind($ARGV[1])) {
+        say "Ok!";
+      }else{  
+        say "Error code: ".$usbip->{error};
+        say $usbip->{error_msg}
+      };
     }
     case 'release' {
       say "Releasing port $ARGV[1]:";
-      unless ($usbip->release_dev($ARGV[1])) { say $usbip->{last_error} };
+      if ($usbip->release($ARGV[1])) {
+        say "Ok!";
+      }else{  
+        say "Error code: ".$usbip->{error};
+        say $usbip->{error_msg}
+      };
     }
     else { print "Usage: usbip.pl [COMMAND] [PARAMETER]\n\n\t* bind <device-id>\n\t* unbind <device-id>\n\t* release <port>\n\n"; }
   }
@@ -129,10 +144,13 @@ Simple Client:
   
   die "cannot connect to the server $!\n" unless $sock;
   
+  $sock->setsockopt(SOL_SOCKET,SO_REUSEADDR,1);
+  $sock->setsockopt(SOL_SOCKET,SO_KEEPALIVE,1);
+  
   my $usbip = Linux::USBIP->new();
   my $export_info = $usbip->export_dev($ARGV[1],fileno $sock);
   
-  $export_info or die "Couldn't export device: ".$usbip->{last_error};
+  $export_info or die "Couldn't export device: ".$usbip->{error_msg};
   
   $sock->send($export_info);
 
@@ -147,37 +165,59 @@ Module constructor
 
 sub new {
   my $self = {
-               last_error => ''
+               error => 0,
+               error_msg => undef
              };
   return bless $self;
 }
 
-=head2 bind_dev
+sub _clear_error {
+    my $self = shift;
+    $self->{error} = 0;
+    $self->{error_msg} = undef;
+}
+
+sub _save_error {
+    my $self = shift;
+    $self->{error} = $!;
+    $self->{error_msg} = join(": ", @_, "$!");
+    undef;
+}
+
+sub _set_error {
+    my $self = shift;
+    $! = shift;
+    $self->_save_error(@_);
+}
+
+
+=head2 bind
 
 Bind a device to usbip_host driver. (usbip_host side)
 Expects busid.
 
 =cut
 
-sub bind_dev {
+sub bind {
   my ($self,$busid) = @_;
 
+  $self->_clear_error;
+
   # Don't bind hubs
-  open my $bDevClass , '<' , "/sys/bus/usb/devices/".$busid."/bDeviceClass" or
-    ($self->{last_error} = "Can't find busid: ".$busid and return);
-  if ( <$bDevClass> =~ /09/ ){
-    $self->{last_error} = "busid: $busid is a hub. Won't do";
-    return;
-  }
-  close $bDevClass;
+  my $bDevClass_fn = "/sys/bus/usb/devices/$busid/bDeviceClass";
+  open my $bDevClass , '<' , $bDevClass_fn
+    or return $self->_save_error($bDevClass_fn);
+  <$bDevClass> =~ /^09$/
+    and return $self->_set_error(Errno::EINVAL, $bDevClass_fn, "Invalid device class");
+  close $bDevClass
+    or return $self->_save_error($bDevClass_fn);
 
   # Disconnect from driver
-  my $driver = abs_path("/sys/bus/usb/devices/".$busid."/driver") or
-    ($self->{last_error} = "Can't find busid: ".$busid and return);
-  if ( $driver =~ /usbip-host/ ){
-    $self->{last_error} = "busid: $busid is already binded";
-    return;
-  }
+  my $driver_path = "/sys/bus/usb/devices/$busid/driver";
+  my $driver = abs_path($driver_path)
+    or return $self->save_error($driver_path);
+  $driver =~ /usbip-host/
+    and return $self->_set_error(Errno::EINVAL,$driver_path,"busid: $busid is already binded");
   $self->_write_sysfs($driver."/unbind",$busid) or return;
 
   # Bind to usbip_host driver
@@ -187,23 +227,23 @@ sub bind_dev {
   return 1;
 }
 
-=head2 unbind_dev
+=head2 unbind
 
 Unbind a device from usbip_host driver. (usbip_host side)
 Expects busid.
 
 =cut
 
-sub unbind_dev {
+sub unbind {
   my ($self,$busid) = @_;
 
+  $self->_clear_error;
   # Check the device is binded to usbip-host driver
-  my $driver = abs_path("/sys/bus/usb/devices/".$busid."/driver") or
-    ($self->{last_error} = "Can't find busid: ".$busid and return);
-  unless ( $driver =~ /usbip-host/ ){
-    $self->{last_error} = "busid: $busid is not binded";
-    return;
-  }
+  my $driver_path = "/sys/bus/usb/devices/$busid/driver";
+  my $driver = abs_path($driver_path)
+    or return $self->_save_error($driver_path,"Can't find busid: ".$busid);
+  $driver =~ /usbip-host$/
+    or return $self->_set_error(Errno::EINVAL,"busid: $busid is not binded");
 
   # Unbind from usbip_host driver
   $self->_write_sysfs($host_unbind,$busid) or return;
@@ -215,11 +255,11 @@ sub unbind_dev {
   return 1;
 }
 
-=head2 export_dev
+=head2 export
 
 Export a device to remote system. (usbip_host side)
 Expects busid and socket fd.
-Outputs devid of device, which must be sent over network for the import_dev command.
+Outputs devid of device, which must be sent over network for the import command.
 
 =cut
 
@@ -227,53 +267,56 @@ sub export_dev {
   my ($self,$busid,$sock) = @_;
   my $data;
 
+  $self->_clear_error;
   # Check the device is binded to usbip-host driver
-  my $driver = abs_path("/sys/bus/usb/devices/".$busid."/driver") or
-    ($self->{last_error} = "Can't find busid: ".$busid and return);
+  my $driver_fn = "/sys/bus/usb/devices/$busid/driver";
+  my $driver = abs_path($driver_fn)
+    or return $self->_save_error($driver_fn,"Can't find busid: ".$busid);
 
-  unless ( $driver =~ /usbip-host/ ){
-    $self->{last_error} = "busid: $busid is not binded";
-    return;
-  }
+  $driver =~ /usbip-host/
+    or return $self->_set_error(Errno::EINVAL,"busid: $busid is not binded");
 
   # Check it is available
-  open my $status, '<', abs_path($host_driver.$busid.$attr_status) or
-    ($self->{last_error} = "Can't find busid: ".$busid and return);
-  unless ( <$status> == 1 ){
-    $self->{last_error} = "busid: $busid is in use";
-    return;
-  }
-  close $status;
+  my $status_fn = "$host_driver/$busid/$attr_status";
+  open my $status, '<', abs_path($status_fn)
+    or return $self->_save_error($status_fn,"No status for: ".$busid);
+  <$status> == 1
+    or return $self->_set_error(Errno::EINVAL,$status_fn,"busid: $busid is in use");
+  close $status
+    or return $self->_save_error($status_fn);
 
   # Attach to remote
-  $self->_write_sysfs(abs_path($host_driver.$busid.$attr_sockfd),$sock) or return;
+  $self->_write_sysfs(abs_path("$host_driver/$busid/$attr_sockfd"),$sock) or return;
 
   # Generate devid and speed
-  open my $busnumfd, '<', abs_path($host_driver.$busid."/busnum") or
-    ($self->{last_error} = "Can't find busnum for: ".$busid and return);
-  open my $devnumfd, '<', abs_path($host_driver.$busid."/devnum") or
-    ($self->{last_error} = "Can't find devnum for: ".$busid and return);
-  open my $speedfd, '<', abs_path($host_driver.$busid."/speed") or
-    ($self->{last_error} = "Can't find speed for: ".$busid and return);
+  open my $busnumfd, '<', abs_path("$host_driver/$busid/busnum")
+    or return $self->_save_error("Can't find busnum for: ".$busid);
+  open my $devnumfd, '<', abs_path("$host_driver/$busid/devnum")
+    or return $self->_save_error("Can't find devnum for: ".$busid);
+  open my $speedfd, '<', abs_path("$host_driver/$busid/speed")
+    or return $self->_save_error("Can't find speed for: ".$busid);
   
   my $devid = oct "0b".unpack("B16",pack("n",<$busnumfd>)).unpack("B16",pack("n",<$devnumfd>));
   my $numeric_speed = <$speedfd>;
 
-  close($busnumfd);
-  close($devnumfd);
-  close($speedfd);
+  close($busnumfd)
+    or return $self->_save_error("$host_driver/$busid/busnum");
+  close($devnumfd)
+    or return $self->_save_error("$host_driver/$busid/devnum");
+  close($speedfd)
+    or return $self->_save_error("$host_driver/$busid/speed");
 
   chomp $numeric_speed;
   my $speed = $speed_map{$numeric_speed};
 
-  return $busid." ".$devid." ".$speed;
+  return "$busid $devid $speed";
 }
 
-=head2 import_dev
+=head2 import
 
 Import a device from remote system. (usbip_vhci side)
 Expects:
-- export_dev's output
+- export's output
 - socket fd
 - peerhost
 - peerport
@@ -284,19 +327,21 @@ sub import_dev {
   my ($self,$device_data,$sock,$peerhost,$peerport) = @_;
   my ($busid,$devid,$speed) = split (" ", $device_data);
 
+  $self->_clear_error;
   # Look for free port matching device speed
   my $port = $self->_get_free_port($speed);
-  unless (defined $port){ $self->{last_error} = "couldn't find free port matching device speed"; return;}
+  defined $port
+    or return $self->_set_error(Errno::EINVAL,"couldn't find free port matching device speed");
 
   # Attach to remote
-  $self->_write_sysfs($vhci_driver.$vhci_attach, $port." ".$sock." ".$devid." ".$speed) or return;
+  $self->_write_sysfs("$vhci_driver/$vhci_attach", "$port $sock $devid $speed") or return;
   mkdir $vhci_varrun;
-  $self->_write_sysfs($vhci_varrun."port".$port, "$peerhost $peerport $busid\n") or return;
+  $self->_write_sysfs("$vhci_varrun/port$port", "$peerhost $peerport $busid\n") or return;
 
   return 1;
 }
 
-=head2 release_dev
+=head2 release
 
 Release an imported device. (usbip_vhci side)
 Expects:
@@ -304,14 +349,16 @@ Expects:
 
 =cut
 
-sub release_dev {
+sub release {
   my ($self,$port) = @_;
 
+  $self->_clear_error;
   # Delete status file
-  unlink $vhci_varrun."port".$port or ( $self->{last_error} = "Can't delete status file: ".$vhci_varrun."port".$port and return);
+  unlink "$vhci_varrun/port$port"
+    or return $self->_save_error("Can't delete status file: ".$vhci_varrun."/port".$port);
 
   # Detach
-  $self->_write_sysfs($vhci_driver.$vhci_detach, $port) or return;
+  $self->_write_sysfs("$vhci_driver/$vhci_detach", $port) or return;
 
   return 1;
 }
@@ -327,12 +374,15 @@ Write to driver's sysfs.
 sub _write_sysfs {
   my ($self,$sysfs_file,$msg) = @_;
 
-  open my $file , '>' , $sysfs_file or
-    ($self->{last_error} = "Can't write to ".$sysfs_file and return);
-  print $file $msg;
-  close $file;
+  open my $file , '>' , $sysfs_file
+    or return $self->_save_error($sysfs_file);
+  print $file $msg
+    or return $self->_save_error($sysfs_file);
+  close $file
+    or return $self->_save_error($sysfs_file);
 
 print "$sysfs_file\<\<$msg\n";
+
   return 1;
 }
 
@@ -344,9 +394,10 @@ Get first free port matching given speed
 
 sub _get_free_port {
   my ($self,$speed) = @_;
-  my @files = glob($vhci_driver."status*");
+  my @files = glob($vhci_driver."/status*");
   foreach my $file (@files){
-    open my $fd,'<',$file or die "Can't access vhci_driver";
+    open my $fd,'<',$file
+      or return $self->_save_error($file,"Can't access vhci_driver");
     while(my $line = <$fd>){
       my ($hub_speed,$port,$status, , , , ) = split(' ',$line);
       if($hub_speed eq $speed_to_string{$speed} and $status eq '004'){

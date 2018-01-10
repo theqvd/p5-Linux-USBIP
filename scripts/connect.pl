@@ -2,7 +2,6 @@
 
 use warnings;
 use strict;
-use Data::Dumper;
 
 use IO::Socket::INET;
 use Socket qw/IPPROTO_TCP TCP_NODELAY SOL_SOCKET SO_REUSEADDR SO_KEEPALIVE/;
@@ -16,10 +15,13 @@ my $sock = IO::Socket::INET->new(PeerAddr => $ARGV[0],
 
 die "cannot connect to the server $!\n" unless $sock;
 
+$sock->setsockopt(SOL_SOCKET,SO_REUSEADDR,1);
+$sock->setsockopt(SOL_SOCKET,SO_KEEPALIVE,1);
+
 my $usbip = Linux::USBIP->new();
 my $export_info = $usbip->export_dev($ARGV[1],fileno $sock);
 
-$export_info or die "Couldn't export device: ".$usbip->{last_error};
+$export_info or die "Couldn't export device: ".$usbip->{error_msg};
 
 $sock->send($export_info);
 

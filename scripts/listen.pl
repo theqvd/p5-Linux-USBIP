@@ -2,7 +2,6 @@
 
 use warnings;
 use strict;
-use Data::Dumper;
 
 use IO::Socket::INET;
 use Socket qw/IPPROTO_TCP TCP_NODELAY SOL_SOCKET SO_REUSEADDR SO_KEEPALIVE/;

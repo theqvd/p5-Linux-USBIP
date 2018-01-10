@@ -13,16 +13,31 @@ switch ( $ARGV[0] ){
 
   case 'bind' {
     say "Binding $ARGV[1]:";
-    unless ($usbip->bind_dev($ARGV[1])) { say $usbip->{last_error} };
+    if ($usbip->bind($ARGV[1])) { 
+      say "Ok!";
+    }else{ 
+      say "Error code: ".$usbip->{error};
+      say $usbip->{error_msg}
+    };
   }
     
   case 'unbind' {
     say "Unbinding $ARGV[1]:";
-    unless ($usbip->unbind_dev($ARGV[1])) { say $usbip->{last_error} };
+    if ($usbip->unbind($ARGV[1])) {
+      say "Ok!";
+    }else{  
+      say "Error code: ".$usbip->{error};
+      say $usbip->{error_msg}
+    };
   }
   case 'release' {
     say "Releasing port $ARGV[1]:";
-    unless ($usbip->release_dev($ARGV[1])) { say $usbip->{last_error} };
+    if ($usbip->release($ARGV[1])) {
+      say "Ok!";
+    }else{  
+      say "Error code: ".$usbip->{error};
+      say $usbip->{error_msg}
+    };
   }
   else { print "Usage: usbip.pl [COMMAND] [PARAMETER]\n\n\t* bind <device-id>\n\t* unbind <device-id>\n\t* release <port>\n\n"; }
 }
