@@ -1,32 +1,26 @@
 package Linux::USBIP;
 
-use 5.006;
+our $VERSION = '0.01';
+
+use 5.010;
 use strict;
 use warnings;
 use Errno ();
+use Carp;
 
-use Cwd qw/abs_path/;
+use Cwd qw(abs_path);
 
-our $vhci_driver = "/sys/devices/platform/vhci_hcd.0";
-our $vhci_varrun = "/var/run/vhci_hcd";
-our $vhci_attach = "attach";
-our $vhci_detach = "detach";
-our $host_driver = "/sys/bus/usb/drivers/usbip-host";
-our $host_bind = "$host_driver/bind";
-our $host_unbind = "$host_driver/unbind";
-our $host_rebind = "$host_driver/rebind";
-our $host_match_busid = "$host_driver/match_busid";
-our $attr_sockfd = "usbip_sockfd";
-our $attr_status = "usbip_status";
-our %speed_map = (
-                  '1.5'     => '1',
-                  '12'      => '2',
-                  '480'     => '3',
-                  '5000'    => '5',
-                  '10000'   => '6',
-                  'unknown' => '0'
-);
-our %speed_to_string = (
+# Those mappings have been extracted from the USB/IP tools source code:
+
+our %speed2int = ( '1.5'     => '1',
+                   '12'      => '2',
+                   '480'     => '3',
+                   '5000'    => '5',
+                   '10000'   => '6',
+                   'unknown' => '0'
+                 );
+
+our %int2hub_speed = (
                   '1' => 'hs',
                   '2' => 'hs',
                   '3' => 'hs',
@@ -35,467 +29,477 @@ our %speed_to_string = (
                   '0' => 'hs'
 );
 
+sub new {
+  my ($class, %opts) = @_;
+
+  my $sysfs_root = delete $opts{sysfs_root} // '/sys';
+  $sysfs_root =~ s|(?<=.)/+||; # remove any trailing slashes
+  $sysfs_root =~ /^\// or croak "sysfs_root must point to an absolute directory";
+
+  my $run_path = $opts{run_path} // '/var/run/vhci_hcd';
+  $run_path =~ s|(?<=.)/+||;
+
+  my $self = { sysfs_root => $sysfs_root,
+               run_path => $run_path,
+               platform_path => "$sysfs_root/devices/platform",
+               drivers_path =>"$sysfs_root/bus/usb/drivers",
+               drivers_usbip_host_path => "$sysfs_root/bus/usb/drivers/usbip-host",
+               devices_path => "$sysfs_root/bus/usb/devices",
+             };
+
+  bless $self, $class;
+  $self->_clear_error;
+
+  return $self;
+}
+
+sub _clear_error {
+  my $self = shift;
+  $self->{error} = 0;
+  $self->{error_msg} = undef;
+}
+
+sub _save_error {
+  my $self = shift;
+  $self->{error} = $!;
+  $self->{error_msg} = join(": ", @_, "$!");
+  undef;
+}
+
+sub _set_error {
+  my $self = shift;
+  $! = shift;
+  $self->_save_error(@_);
+}
+
+sub bind {
+  my ($self, $busid) = @_;
+
+  $self->_clear_error;
+  my $usbip_host_path = $self->_realpath("$self->{drivers_path}/usbip-host") // return;
+
+  # Don't bind hubs
+  my $devclass_path = "$self->{devices_path}/$busid/bDeviceClass";
+  my $devclass = $self->_file_get_line($devclass_path) // return;
+  $devclass eq '09'
+    and return $self->_set_error(Errno::EINVAL, $devclass_path, "Invalid device class $devclass for device $busid");
+
+  # Disconnect from driver
+  my $driver_path = "$self->{devices_path}/$busid/driver" // return;
+  my $driver_realpath = $self->_realpath($driver_path) // return;
+
+  # Commenting out the following code because, well, it was already binded, and so what?
+  # $driver_realpath eq $usbip_host_path
+  #   and return $self->_set_error(Errno::EINVAL, $driver_path, "Device $busid already binded");
+
+  $self->_file_atomic_put("$driver_path/unbind", $busid)
+    and $self->_file_atomic_put("$usbip_host_path/match", "add $busid")
+    and $self->_file_atomic_put("$usbip_host_path/bind", $busid)
+}
+
+sub unbind {
+  my ($self, $busid) = @_;
+
+  $self->_clear_error;
+  my $usbip_host_path = $self->_realpath("$self->{drivers_path}/usbip-host") // return;
+
+  # Check the device is binded to usbip-host driver
+  my $driver_path = "$self->{devices_path}/$busid/driver";
+  my $driver_realpath = $self->_realpath($driver_path) // return;
+
+  $driver_realpath eq $usbip_host_path
+    or return $self->_set_error(Errno::EINVAL, $driver_path, "Device $busid is not binded to usbip-host driver");
+
+  $self->_file_atomic_put("$usbip_host_path/unbind", $busid)
+    and $self->_file_atomic_put("$usbip_host_path/match_busid", "del $busid")
+    and $self->_file_atomic_put("$usbip_host_path/rebind", $busid)
+}
+
+sub _sock2fd {
+  my ($self, $sock) = @_;
+
+  local $@;
+  if (defined (my $fd = eval { fileno $sock })) {
+    return $fd if $fd >= 0;
+  }
+  else {
+    return $1 if $sock =~ /^(\d+)$/;
+  }
+  croak "The given value is not a file handle or file descriptor number";
+}
+
+sub export {
+  my ($self, $busid, $sock) = @_;
+  $self->_clear_error;
+
+  my $sockfd = $self->_sock2fd($sock);
+  my $usbip_host_path = $self->_realpath("$self->{drivers_path}/usbip-host") // return;
+
+  # Check the device is binded to usbip-host driver
+  my $driver_path = "$self->{drivers_path}/$busid/driver";
+  my $driver_realpath = $self->_realpath($driver_path) // return;
+
+  $driver_realpath eq $usbip_host_path
+    or return $self->_set_error(Errno::EINVAL, $driver_path,
+                                "Device $busid is not binded to usbip-host driver");
+
+  # Check it is available
+  my $status_path = "$usbip_host_path/$busid/usbip_status";
+  my $status = $self->_file_get_line($status_path) // return;
+  $status == 1 or return $self->_set_error(Errno::EBUSY, $status_path,
+                                           "Device $busid is already in use");
+
+  # Attach to remote
+  $self->_file_atomic_put("$usbip_host_path/$busid/usbip_sockfd", $sockfd) // return;
+
+  my $busnum = $self->_file_get_line("$usbip_host_path/$busid/busnum") // return;
+  my $devnum = $self->_file_get_line("$usbip_host_path/$busid/devnum") // return;
+
+  my $devid = ($busnum << 16) + $devnum;
+
+  my $speed = $self->_file_get_line("$usbip_host_path/$busid/speed") // return;
+  my $numeric_speed = $speed2int{$speed} // 0;
+
+  wantarray ? ($devid, $numeric_speed) : "$devid $numeric_speed";
+}
+
+*export_dev = \&export;
+
+sub attach {
+  my ($self, $sock, $devid, $speed, $vhci) = @_;
+  $self->_clear_error;
+
+  my $sock_fd = $self->_sock2fd($sock);
+  my $vhci_prefix = "$self->{platform_path}/vhci_hcd";
+  my $new_version = not -f "$vhci_prefix.0/status.1";
+
+  my @ixs;
+  if (defined $vhci) {
+    $vhci =~ /^\d+$/ or croak "Invalid VHCI index";
+    @ixs = $vhci;
+  }
+  else {
+    opendir my $dh, $self->{platform_path}
+      or return $self->_save_error($self->{platform_path});
+    while (defined (my $dir = readdir $dh)) {
+      push @ixs, $1 if $dir =~ /^vhci_hcd\.(\d+)$/;
+    }
+    closedir $dh;
+  }
+
+  my ($attach_fh, $attach_path, $vhci_path, $last_path);
+  unless ($new_version) {
+    $vhci_path = "$vhci_prefix.0";
+    $attach_path = "$vhci_path/attach";
+    open $attach_fh, '>', $attach_path
+      or return $self->_save_error($attach_path)
+  }
+
+  # Errors when opening files are ignored in the following code
+  # because those are normal under certain sysfs configurations.
+  for my $ix (@ixs) {
+    my $status_path;
+    if ($new_version) {
+      $vhci_path = "$vhci_prefix.$ix";
+      $status_path = "$vhci_path/status";
+      $attach_path = "$vhci_path/attach";
+      close $attach_path if defined $attach_path;
+      open $attach_fh, '>', $attach_path or next;
+    }
+    else {
+      $status_path = "$vhci_path/status" . ($ix ? ".$ix" : '');
+    }
+    $last_path = $status_path;
+
+    my $expected_hub = (($speed == 5 or $speed == 6) ? 'ss' : 'hs');
+
+    if (open my $fh, '<', $status_path) {
+      my $offset;
+      scalar <$fh>; # discard header
+      while (<$fh>) {
+        my ($hub, $port, $sta) = split /\s+/, $_;
+        $port = int $port; $sta = int $sta;
+        $offset //= $port;
+        if ($hub eq $expected_hub and $sta == 4) {
+          if (__atomic_syswrite($attach_fh, "$port $sock_fd $devid $speed\n")) {
+            my $effective_ix = ($new_version ? $ix : 0);
+            return (wantarray ? ($effective_ix, $port) : "$effective_ix-$port")
+          }
+          else {
+            redo if $! == Errno::EINTR;
+            next if $! == Errno::EBUSY;
+            return $self->_save_error($attach_path);
+          }
+        }
+      }
+    }
+  }
+  $self->_set_error(Errno::ENOSPC, $last_path, "Unable to find an unused USB/IP port");
+}
+
+*import_dev = \&attach;
+
+sub save_port_data {
+  my ($self, $ix, $port, $peerhost, $peerport, $peerbusid) = @_;
+  $self->_clear_error;
+
+  my $new_version = not -f "$self->{platform_path}/vhci_hcd.0/status.1";
+  my $run_path = $self->{run_path};
+  $_ //= '-' for ($peerhost, $peerport, $peerbusid);
+  $self->_ensure_dir($run_path)
+    and $self->_file_atomic_put("$run_path/port" . ($new_version ? "$ix-$port" : $port),
+                                "$peerhost $peerport $peerbusid\n")
+}
+
+sub detach {
+  my ($self, $ix, $port) = @_;
+  $self->_clear_error;
+
+  my $vhci_prefix = "$self->{platform_path}/vhci_hcd";
+  my $new_version = not -f "$vhci_prefix.0/status.1";
+  $self->_file_atomic_put(($new_version
+                           ? "$vhci_prefix.$ix/detach"
+                           : "$vhci_prefix.0/detach"),
+                          $port)
+}
+
+*release = \&detach;
+
+
+sub rm_port_data {
+  my ($self, $ix, $port) = @_;
+  $self->_clear_error;
+
+  my $run_path = $self->{run_path};
+  my @paths = "$run_path/port$ix-$port";
+  push @paths, "$run_path/port$port" if $ix == 0;
+
+  for (@paths) {
+    if (-f $_) {
+      unlink $_
+        or return $self->_save_error($_);
+    }
+  }
+  return 1;
+}
+
+sub _ensure_dir {
+  my ($self, $path) = @_;
+  -d $path
+    or mkdir $path
+    or $self->_save_error($path);
+}
+
+sub __atomic_syswrite {
+  my $fh = shift;
+  for (1) {
+    my $bytes = syswrite($fh, $_[0]);
+    if (defined $bytes) {
+      return 1 if $bytes == length $_[0];
+      $! = Errno::EBADE;
+      return;
+    }
+    return unless $! == Errno::EINTR;
+  }
+}
+
+sub _file_atomic_put {
+  my ($self, $path, $msg) = @_;
+  my $fh;
+  open $fh , '>' , $path
+    and __atomic_syswrite($fh, $msg)
+    and close $fh
+    or $self->_save_error($path);
+}
+
+sub _file_get_line {
+  my ($self, $path) = @_;
+  if (open my $fh, '<', $path) {
+    my $data = <$fh> // '';
+    if (close $fh) {
+      chomp $data;
+      return $data;
+    }
+  }
+  $self->_save_error($path);
+}
+
+sub _file_get {
+  my $self = shift;
+  undef $/;
+  $self->_file_get_line(@_)
+}
+
+sub _realpath {
+  my ($self, $path) = @_;
+  abs_path($path) // $self->_save_error($path)
+}
+
+1;
+
+__END__
+
+
 =head1 NAME
 
-Linux::USBIP - Library for using Linux's kernel usbip functions. 
-
-=head1 VERSION
-
-Version 0.01
-
-=cut
-
-our $VERSION = '0.01';
-
+Linux::USBIP - Manage Linux USB/IP ports and connections.
 
 =head1 SYNOPSIS
 
-Provide access to Linux kernel's usbip functions.
+  use v5.10;
+  use Linux::USBIP;
+
+  my $usbip = Linux::USBIP->new();
+
+
+  # On the host where the physical USB devices are attached...
+
+  # Bind some device to the usbip_host driver so that it can be
+  # exported using USB/IP:
+  $usbip->bind('3-6') // die $!;
+
+  # Connect the device to a socket:
+  my $sock = ...
+  $usbip->export('3-6', $sock) // die $!;
+
+  # Kill the ongoing USB/IP connection
+  $usbip->release('3-6') // die $!;
+
+  # Unbind it
+  $usbip->unbind('3-6') // die $!;
+
+
+  # Now, on the other host where we want to use the remote devices...
+
+  # Attach a remote USB device:
+  my $sock = ...;
+  my ($vix, $port) = $usbip->attach($sock, $peer_dev_id, $speed) // die $!;
+
+  # Optionally, save the info so that it can be seen by the USB/IP utils:
+  $usbip->save_port_data($vix, $port,
+                         $peerhost, $peerport, $peerbusid) // die $!;
+
+  # Detach the device once you have finished using it:
+  $usbip->detach($vix, $port) // die $!;
+
+  # Optionally, remove its peer data:
+  $usbip->rm_port_data($vix, $port);
+
+
+=head1 DESCRIPTION
+
+Provides access to Linux kernel's usbip functions.
 Different from usbip tool included with kernel sources. It doesn't have
 a server function. This tool dependes on you creating a tcp socket on
 both sides, so you choose which side is server and client.
 
-Simple utility:
+=head1 API
 
-  use v5.10;
-  use Switch;
-  use Linux::USBIP;
-  
-  my $usbip = Linux::USBIP->new();
-  
-  switch ( $ARGV[0] ){
-  
-    case 'bind' {
-      say "Binding $ARGV[1]:";
-      if ($usbip->bind($ARGV[1])) { 
-        say "Ok!";
-      }else{ 
-        say "Error code: ".$usbip->{error};
-        say $usbip->{error_msg}
-      };
-    }
-      
-    case 'unbind' {
-      say "Unbinding $ARGV[1]:";
-      if ($usbip->unbind($ARGV[1])) {
-        say "Ok!";
-      }else{  
-        say "Error code: ".$usbip->{error};
-        say $usbip->{error_msg}
-      };
-    }
-    case 'release' {
-      say "Releasing port $ARGV[1]:";
-      if ($usbip->release($ARGV[1])) {
-        say "Ok!";
-      }else{  
-        say "Error code: ".$usbip->{error};
-        say $usbip->{error_msg}
-      };
-    }
-    else { print "Usage: usbip.pl [COMMAND] [PARAMETER]\n\n\t* bind <device-id>\n\t* unbind <device-id>\n\t* release <port>\n\n"; }
-  }
-
-Simple Server:
-
-  use IO::Socket::INET;
-  use Socket qw/IPPROTO_TCP TCP_NODELAY SOL_SOCKET SO_REUSEADDR SO_KEEPALIVE/;
-  use Linux::USBIP;
-  
-  my $received;
-  my $len=1024;
-  
-  my $usbip = Linux::USBIP->new();
-  
-  my $sock = IO::Socket::INET->new(Listen    => 5,
-                                   LocalPort => '3240',
-                                   Proto     => 'tcp',
-                                   Reuse     => 1 )
-    or die "Can't open socket";
-  
-  $sock->setsockopt(SOL_SOCKET,SO_REUSEADDR,1);
-  $sock->setsockopt(SOL_SOCKET,SO_KEEPALIVE,1);
-  
-  while(1){
-    if (my $newcon = $sock->accept()){
-      $newcon->recv($received,$len);
-      $received or next;
-      print "host: ".$newcon->peerhost()."\n";
-      print "port: ".$newcon->peerport()."\n";
-      print "recv: ".$received."\n";
-  
-      $newcon->setsockopt(IPPROTO_TCP,TCP_NODELAY,1);
-      my $result = $usbip->import_dev($received,fileno $newcon,$newcon->peerhost(),$newcon->peerport());
-    }
-  }
-
-
-Simple Client:
-
-  use IO::Socket::INET;
-  use Socket qw/IPPROTO_TCP TCP_NODELAY SOL_SOCKET SO_REUSEADDR SO_KEEPALIVE/;
-  use Linux::USBIP;
-  
-  @ARGV == 2 or die "Usage: connect.pl <ip> <device>\n\n";
-  
-  my $sock = IO::Socket::INET->new(PeerAddr => $ARGV[0],
-                                   PeerPort => '3240',
-                                   Proto    => 'tcp');
-  
-  die "cannot connect to the server $!\n" unless $sock;
-  
-  $sock->setsockopt(SOL_SOCKET,SO_REUSEADDR,1);
-  $sock->setsockopt(SOL_SOCKET,SO_KEEPALIVE,1);
-  
-  my $usbip = Linux::USBIP->new();
-  my $export_info = $usbip->export_dev($ARGV[1],fileno $sock);
-  
-  $export_info or die "Couldn't export device: ".$usbip->{error_msg};
-  
-  $sock->send($export_info);
-
-
-=head1 SUBROUTINES/METHODS
-
-=head2 new
-
-Module constructor
-
-=cut
-
-sub new {
-  my $self = {
-               error => 0,
-               error_msg => undef
-             };
-  return bless $self;
-}
-
-sub _clear_error {
-    my $self = shift;
-    $self->{error} = 0;
-    $self->{error_msg} = undef;
-}
-
-sub _save_error {
-    my $self = shift;
-    $self->{error} = $!;
-    $self->{error_msg} = join(": ", @_, "$!");
-    undef;
-}
-
-sub _set_error {
-    my $self = shift;
-    $! = shift;
-    $self->_save_error(@_);
-}
-
-
-=head2 bind
-
-Bind a device to usbip_host driver. (usbip_host side)
-Expects busid.
-
-=cut
-
-sub bind {
-  my ($self,$busid) = @_;
-
-  $self->_clear_error;
-
-  # Don't bind hubs
-  my $bDevClass_fn = "/sys/bus/usb/devices/$busid/bDeviceClass";
-  open my $bDevClass , '<' , $bDevClass_fn
-    or return $self->_save_error($bDevClass_fn);
-  <$bDevClass> =~ /^09$/
-    and return $self->_set_error(Errno::EINVAL, $bDevClass_fn, "Invalid device class");
-  close $bDevClass
-    or return $self->_save_error($bDevClass_fn);
-
-  # Disconnect from driver
-  my $driver_path = "/sys/bus/usb/devices/$busid/driver";
-  my $driver = abs_path($driver_path)
-    or return $self->save_error($driver_path);
-  $driver =~ /usbip-host/
-    and return $self->_set_error(Errno::EINVAL,$driver_path,"busid: $busid is already binded");
-  $self->_write_sysfs($driver."/unbind",$busid) or return;
-
-  # Bind to usbip_host driver
-  $self->_write_sysfs($host_match_busid,"add ".$busid) or return;
-  $self->_write_sysfs($host_bind,$busid) or return;
-
-  return 1;
-}
-
-=head2 unbind
-
-Unbind a device from usbip_host driver. (usbip_host side)
-Expects busid.
-
-=cut
-
-sub unbind {
-  my ($self,$busid) = @_;
-
-  $self->_clear_error;
-  # Check the device is binded to usbip-host driver
-  my $driver_path = "/sys/bus/usb/devices/$busid/driver";
-  my $driver = abs_path($driver_path)
-    or return $self->_save_error($driver_path,"Can't find busid: ".$busid);
-  $driver =~ /usbip-host$/
-    or return $self->_set_error(Errno::EINVAL,"busid: $busid is not binded");
-
-  # Unbind from usbip_host driver
-  $self->_write_sysfs($host_unbind,$busid) or return;
-  $self->_write_sysfs($host_match_busid,"del ".$busid) or return;
-
-  # Rebind to original driver
-  $self->_write_sysfs($host_rebind,$busid) or return;
-
-  return 1;
-}
-
-=head2 export
-
-Export a device to remote system. (usbip_host side)
-Expects busid and socket fd.
-Outputs devid of device, which must be sent over network for the import command.
-
-=cut
-
-sub export_dev {
-  my ($self,$busid,$sock) = @_;
-  my $data;
-
-  $self->_clear_error;
-  # Check the device is binded to usbip-host driver
-  my $driver_fn = "/sys/bus/usb/devices/$busid/driver";
-  my $driver = abs_path($driver_fn)
-    or return $self->_save_error($driver_fn,"Can't find busid: ".$busid);
-
-  $driver =~ /usbip-host/
-    or return $self->_set_error(Errno::EINVAL,"busid: $busid is not binded");
-
-  # Check it is available
-  my $status_fn = "$host_driver/$busid/$attr_status";
-  open my $status, '<', abs_path($status_fn)
-    or return $self->_save_error($status_fn,"No status for: ".$busid);
-  <$status> == 1
-    or return $self->_set_error(Errno::EINVAL,$status_fn,"busid: $busid is in use");
-  close $status
-    or return $self->_save_error($status_fn);
-
-  # Attach to remote
-  $self->_write_sysfs(abs_path("$host_driver/$busid/$attr_sockfd"),$sock) or return;
-
-  # Generate devid and speed
-  open my $busnumfd, '<', abs_path("$host_driver/$busid/busnum")
-    or return $self->_save_error("Can't find busnum for: ".$busid);
-  open my $devnumfd, '<', abs_path("$host_driver/$busid/devnum")
-    or return $self->_save_error("Can't find devnum for: ".$busid);
-  open my $speedfd, '<', abs_path("$host_driver/$busid/speed")
-    or return $self->_save_error("Can't find speed for: ".$busid);
-  
-  my $devid = oct "0b".unpack("B16",pack("n",<$busnumfd>)).unpack("B16",pack("n",<$devnumfd>));
-  my $numeric_speed = <$speedfd>;
-
-  close($busnumfd)
-    or return $self->_save_error("$host_driver/$busid/busnum");
-  close($devnumfd)
-    or return $self->_save_error("$host_driver/$busid/devnum");
-  close($speedfd)
-    or return $self->_save_error("$host_driver/$busid/speed");
-
-  chomp $numeric_speed;
-  my $speed = $speed_map{$numeric_speed};
-
-  return "$busid $devid $speed";
-}
-
-=head2 import
-
-Import a device from remote system. (usbip_vhci side)
-Expects:
-- export's output
-- socket fd
-- peerhost
-- peerport
-
-=cut
-
-sub import_dev {
-  my ($self,$device_data,$sock,$peerhost,$peerport) = @_;
-  my ($busid,$devid,$speed) = split (" ", $device_data);
-
-  $self->_clear_error;
-  # Look for free port matching device speed
-  my $port = $self->_get_free_port($speed);
-  defined $port
-    or return $self->_set_error(Errno::EINVAL,"couldn't find free port matching device speed");
-
-  # Attach to remote
-  $self->_write_sysfs("$vhci_driver/$vhci_attach", "$port $sock $devid $speed") or return;
-  mkdir $vhci_varrun;
-  $self->_write_sysfs("$vhci_varrun/port$port", "$peerhost $peerport $busid\n") or return;
-
-  return 1;
-}
-
-=head2 release
-
-Release an imported device. (usbip_vhci side)
-Expects:
-- port device is attached to
-
-=cut
-
-sub release {
-  my ($self,$port) = @_;
-
-  $self->_clear_error;
-  # Delete status file
-  unlink "$vhci_varrun/port$port"
-    or return $self->_save_error("Can't delete status file: ".$vhci_varrun."/port".$port);
-
-  # Detach
-  $self->_write_sysfs("$vhci_driver/$vhci_detach", $port) or return;
-
-  return 1;
-}
-
-=head1 INTERNAL SUBROUTINES
-
-=head2 _write_sysfs
-
-Write to driver's sysfs.
-
-=cut
-
-sub _write_sysfs {
-  my ($self,$sysfs_file,$msg) = @_;
-
-  open my $file , '>' , $sysfs_file
-    or return $self->_save_error($sysfs_file);
-  print $file $msg
-    or return $self->_save_error($sysfs_file);
-  close $file
-    or return $self->_save_error($sysfs_file);
-
-print "$sysfs_file\<\<$msg\n";
-
-  return 1;
-}
-
-=head2 _get_free_port
-
-Get first free port matching given speed
-
-=cut 
-
-sub _get_free_port {
-  my ($self,$speed) = @_;
-  my @files = glob($vhci_driver."/status*");
-  foreach my $file (@files){
-    open my $fd,'<',$file
-      or return $self->_save_error($file,"Can't access vhci_driver");
-    while(my $line = <$fd>){
-      my ($hub_speed,$port,$status, , , , ) = split(' ',$line);
-      if($hub_speed eq $speed_to_string{$speed} and $status eq '004'){
-        # Remove leading zeroes
-        return sprintf("%d",$port);
-      }
-    }
-  }
-  return;
-}
-
-=head1 AUTHOR
-
-Juan Antonio Zea Herranz, C<< <juan.zea at qindel.com> >>
-
-=head1 BUGS
-
-Please report any bugs or feature requests to C<bug-sys-usbip at rt.cpan.org>, or through
-the web interface at L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=Linux-USBIP>.  I will be notified, and then you'll
-automatically be notified of progress on your bug as I make changes.
-
-
-
-
-=head1 SUPPORT
-
-You can find documentation for this module with the perldoc command.
-
-    perldoc Linux::USBIP
-
-
-You can also look for information at:
+=head2 Common methods
 
 =over 4
 
-=item * RT: CPAN's request tracker (report bugs here)
+=item $usbip = Linux::USBIP->new(%opts)
 
-L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=Linux-USBIP>
+Object constructor.
 
-=item * AnnoCPAN: Annotated CPAN documentation
+The following options are accepted:
 
-L<http://annocpan.org/dist/Linux-USBIP>
+=over 4
 
-=item * CPAN Ratings
+=item sysfs_root => $path
 
-L<http://cpanratings.perl.org/d/Linux-USBIP>
+C<sysfs> mount point. Defaults to C</sys>.
 
-=item * Search CPAN
+=item run_path => $path
 
-L<http://search.cpan.org/dist/Linux-USBIP/>
+Directory to save remote USBIP port data. Defaults to
+C</var/run/vhci_hcd> (as used by the USB/IP tools).
 
 =back
 
+=back
 
-=head1 ACKNOWLEDGEMENTS
+=head2 C<usbip_host> side methods
 
+The following are the methods for interacting with the C<usbip_host>
+side (the one where the real physical devices are attached).
+
+=over 4
+
+=item $usbip->bind($busid)
+
+Binds a device to the C<usbip_host> driver.
+
+=item $usbip->unbind($busid)
+
+Unbinds a device from the C<usbip_host> driver so that it can be used
+by the local drivers and applications again.
+
+=item $usbip->export($busid, $sock_or_fd)
+
+Connects the given socket to the USB device with the given busid.
+
+The device must have been previously bound to the C<usbip_host> driver
+using the L<bind> method.
+
+=back
+
+=head2 C<vhci_hcd> side methods
+
+=over 4
+
+=item $usbip->attach($sock, $devid, $speed, $vhci_ix)
+
+Attachs a remote device into the host.
+
+The C<$vhci_ix> argument is optional. When not given, this method will
+look for free ports in all the vhcis.
+
+=item $usbip->save_port_data($vhci_ix, $port, $peerhost, $peerport, $peerbusid)
+
+Saves the given data into a file under C</var/run/vhci_hcd>.
+
+Those files are consulted by the USB/IP tools in order to provide
+information to the user about the current active connections.
+
+=item $usbip->detach($vhci_ix, $port)
+
+Releases a previously attached device.
+
+=item $usbip->rm_port_data($ix, $port)
+
+Removes the file in C</var/run/vhci_hcd> containing the port data.
+
+=back
+
+=head1 AUTHORS
+
+Juan Antonio Zea Herranz, C<< <juan.zea at qindel.com> >>
+
+Salvador Fandiño C<< <salvador@qindel.com> >>
+
+=head1 BUGS AND SUPPORT
+
+Please report any bugs or feature requests using the
+ L<https://github.com/theqvd/p5-Linux-USBIP/issues|GitHub bug tracker>.
 
 =head1 LICENSE AND COPYRIGHT
 
-Copyright 2017 Juan Antonio Zea Herranz.
+Copyright 207-2018 Qindel FormaciE<oacute>n y Servicios, S.L.
 
-This program is free software; you can redistribute it and/or modify it
-under the terms of the the Artistic License (2.0). You may obtain a
-copy of the full license at:
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at
+your option) any later version.
 
-L<http://www.perlfoundation.org/artistic_license_2_0>
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+General Public License for more details.
 
-Any use, modification, and distribution of the Standard or Modified
-Versions is governed by this Artistic License. By using, modifying or
-distributing the Package, you accept this license. Do not use, modify,
-or distribute the Package, if you do not accept this license.
-
-If your Modified Version has been derived from a Modified Version made
-by someone other than you, you are nevertheless required to ensure that
-your Modified Version complies with the requirements of this license.
-
-This license does not grant you the right to use any trademark, service
-mark, tradename, or logo of the Copyright Holder.
-
-This license includes the non-exclusive, worldwide, free-of-charge
-patent license to make, have made, use, offer to sell, sell, import and
-otherwise transfer the Package with respect to any patent claims
-licensable by the Copyright Holder that are necessarily infringed by the
-Package. If you institute patent litigation (including a cross-claim or
-counterclaim) against any party alleging that the Package constitutes
-direct or contributory patent infringement, then this Artistic License
-to you shall terminate on the date that such litigation is filed.
-
-Disclaimer of Warranty: THE PACKAGE IS PROVIDED BY THE COPYRIGHT HOLDER
-AND CONTRIBUTORS "AS IS' AND WITHOUT ANY EXPRESS OR IMPLIED WARRANTIES.
-THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
-PURPOSE, OR NON-INFRINGEMENT ARE DISCLAIMED TO THE EXTENT PERMITTED BY
-YOUR LOCAL LAW. UNLESS REQUIRED BY LAW, NO COPYRIGHT HOLDER OR
-CONTRIBUTOR WILL BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, OR
-CONSEQUENTIAL DAMAGES ARISING IN ANY WAY OUT OF THE USE OF THE PACKAGE,
-EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see L<http://www.gnu.org/licenses/>.
 
 =cut
 
-1; # End of Linux::USBIP
