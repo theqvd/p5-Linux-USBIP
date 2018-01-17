@@ -136,7 +136,7 @@ sub export {
   my $usbip_host_path = $self->_realpath("$self->{drivers_path}/usbip-host") // return;
 
   # Check the device is binded to usbip-host driver
-  my $driver_path = "$self->{drivers_path}/$busid/driver";
+  my $driver_path = "$self->{devices_path}/$busid/driver";
   my $driver_realpath = $self->_realpath($driver_path) // return;
 
   $driver_realpath eq $usbip_host_path
