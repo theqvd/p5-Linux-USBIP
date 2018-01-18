@@ -10,6 +10,14 @@ use Carp;
 
 use Cwd qw(abs_path);
 
+our $debug //= 0;
+sub _debug {
+    $debug or return;
+    my $msg = "@_\n";
+    local $!;
+    warn $msg;
+}
+
 # Those mappings have been extracted from the USB/IP tools source code:
 
 our %speed2int = ( '1.5'     => '1',
@@ -57,13 +65,15 @@ sub _clear_error {
   my $self = shift;
   $self->{error} = 0;
   $self->{error_msg} = undef;
+  1;
 }
 
 sub _save_error {
   my $self = shift;
   $self->{error} = $!;
   $self->{error_msg} = join(": ", @_, "$!");
-  undef;
+  _debug("_save_error($!, $self->{error_msg})");
+  ()
 }
 
 sub _set_error {
@@ -92,9 +102,16 @@ sub bind {
   # $driver_realpath eq $usbip_host_path
   #   and return $self->_set_error(Errno::EINVAL, $driver_path, "Device $busid already binded");
 
-  $self->_file_atomic_put("$driver_path/unbind", $busid)
-    and $self->_file_atomic_put("$usbip_host_path/match", "add $busid")
+  $self->_file_atomic_put("$driver_path/unbind", $busid) // return;
+  $self->_file_atomic_put("$usbip_host_path/match_busid", "add $busid")
     and $self->_file_atomic_put("$usbip_host_path/bind", $busid)
+    and return 1;
+
+  # On failure try to revert the unbind
+  _debug("Unable to bind $busid to usbip_host driver, ",
+         "reverting to old driver at $driver_realpath");
+  local ($!, @{$self}{qw(error error_msg)});
+  $self->_file_atomic_put("$driver_realpath/bind", $busid);
 }
 
 sub unbind {
@@ -112,7 +129,7 @@ sub unbind {
 
   $self->_file_atomic_put("$usbip_host_path/unbind", $busid)
     and $self->_file_atomic_put("$usbip_host_path/match_busid", "del $busid")
-    and $self->_file_atomic_put("$usbip_host_path/rebind", $busid)
+    and $self->_file_atomic_put("$usbip_host_path/rebind", $busid);
 }
 
 sub _sock2fd {
@@ -285,9 +302,16 @@ sub rm_port_data {
 
 sub _ensure_dir {
   my ($self, $path) = @_;
-  -d $path
-    or mkdir $path
-    or $self->_save_error($path);
+  if (-d $path) {
+    _debug("Directory $path already exists");
+    return 1;
+  }
+  if (mkdir $path) {
+    _debug("Directory $path created");
+    return 1;
+  }
+  _debug("Unable to create directory at $path");
+  $self->_save_error($path);
 }
 
 sub __atomic_syswrite {
@@ -296,20 +320,32 @@ sub __atomic_syswrite {
     my $bytes = syswrite($fh, $_[0]);
     if (defined $bytes) {
       return 1 if $bytes == length $_[0];
+      _debug("__atomic_syswrite failed: not all data was actually written, " .
+             "msg length: ".length($_[0]).", bytes written: $bytes");
       $! = Errno::EBADE;
-      return;
     }
-    return unless $! == Errno::EINTR;
+    redo if $! == Errno::EINTR;
   }
+  _debug("__atomic_syswrite failed: $!");
+  ()
 }
 
 sub _file_atomic_put {
   my ($self, $path, $msg) = @_;
   my $fh;
-  open $fh , '>' , $path
-    and __atomic_syswrite($fh, $msg)
-    and close $fh
-    or $self->_save_error($path);
+  if (open $fh , '>' , $path) {
+    if (__atomic_syswrite($fh, $msg)) {
+      if (close $fh) {
+        return 1;
+      }
+      _debug("Unable to close file $path: $!");
+    }
+    _debug("Unable to write data to $path: $!");
+  }
+  else {
+    _debug("Unable to open file $path: $!");
+  }
+  $self->_save_error($path);
 }
 
 sub _file_get_line {
@@ -318,8 +354,15 @@ sub _file_get_line {
     my $data = <$fh> // '';
     if (close $fh) {
       chomp $data;
+      _debug("Data read from $path: $data");
       return $data;
     }
+    else {
+      _debug("Unable to close file $path after reading: $!");
+    }
+  }
+  else {
+    _debug("Unable to open file $path for reading: $!");
   }
   $self->_save_error($path);
 }
@@ -332,7 +375,11 @@ sub _file_get {
 
 sub _realpath {
   my ($self, $path) = @_;
-  abs_path($path) // $self->_save_error($path)
+  if (defined(my $abs_path = abs_path($path))) {
+    return $abs_path;
+  }
+  _debug("_realpath($path) failed");
+  $self->_save_error($path)
 }
 
 1;
